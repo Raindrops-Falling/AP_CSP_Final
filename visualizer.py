@@ -13,58 +13,52 @@ class NeuralVisualizer:
         self.batches_per_epoch = batches_per_epoch
 
         # nodes
-        self.input_nodes = ["Input"]
+        self.seq_input_nodes = [f"S{i+1}" for i in range(4)]
+        self.delta_input_nodes = [f"D{i+1}" for i in range(4)]
         self.gru_nodes = [f"G{i}" for i in range(8)]
-        self.delta_nodes = [f"D{i}" for i in range(4)]
         self.output_nodes = ["Output"]
 
         for node in (
-            self.input_nodes
+            self.seq_input_nodes
+            + self.delta_input_nodes
             + self.gru_nodes
-            + self.delta_nodes
             + self.output_nodes
         ):
             self.G.add_node(node)
 
-        # edges: input -> all 12 middle nodes -> output
-        for inp in self.input_nodes:
+        # edges: sequence + delta inputs -> hidden GRU layer -> output
+        for inp in self.seq_input_nodes + self.delta_input_nodes:
             for gru in self.gru_nodes:
                 self.G.add_edge(inp, gru)
-            for delta in self.delta_nodes:
-                self.G.add_edge(inp, delta)
 
         for gru in self.gru_nodes:
             self.G.add_edge(gru, "Output")
-        for delta in self.delta_nodes:
-            self.G.add_edge(delta, "Output")
 
-        # positions: horizontal layout
+        # positions: top row for inputs, middle row for hidden layer
         self.pos = {}
-        # input at top center
-        total = len(self.gru_nodes) + len(self.delta_nodes)
-        mid_x = (total - 1) / 2.0
-        self.pos["Input"] = (mid_x, 2.0)
+        top_y = 2.2
+        for i, n in enumerate(self.seq_input_nodes):
+            self.pos[n] = (i * 1.0, top_y)
+        for i, n in enumerate(self.delta_input_nodes):
+            self.pos[n] = ((len(self.seq_input_nodes) + i) * 1.0, top_y)
 
-        # middle row: 8 GRU then 4 delta
         middle_y = 1.0
-        for i, n in enumerate(self.gru_nodes + self.delta_nodes):
+        for i, n in enumerate(self.gru_nodes):
             self.pos[n] = (i * 1.0, middle_y)
 
-        # output at bottom
-        self.pos["Output"] = (mid_x, 0.0)
+        self.pos["Output"] = ((len(self.gru_nodes) - 1) * 1.0 / 2.0, 0.0)
 
         # smoothing (EMA)
         self.smoothing_alpha = smoothing_alpha
         self.prev_gru = None
         self.prev_delta = None
-        self.prev_input = None
 
         # track MAE history for plotting
         self.mae_history = []
         self.batch_history = []
 
         plt.ion()
-        self.fig, self.ax = plt.subplots(figsize=(12, 4))
+        self.fig, self.ax = plt.subplots(figsize=(12, 6))
         self.fig.show()
         self.fig.canvas.draw()
 
@@ -90,7 +84,7 @@ class NeuralVisualizer:
         plt.close(fig_mae)
 
 
-    def update(self, epoch, batch, mae, input_val, gru_values, delta_values):
+    def update(self, epoch, batch, mae, seq_examples, delta_values, gru_values):
         self.ax.clear()
 
         # track MAE history (global batch counter)
@@ -100,7 +94,7 @@ class NeuralVisualizer:
 
         # get magnitudes and apply EMA smoothing
         gru_strength = abs(gru_values[: len(self.gru_nodes)])
-        delta_strength = abs(delta_values[: len(self.delta_nodes)])
+        delta_strength = abs(delta_values[: len(self.delta_input_nodes)])
 
         if self.prev_gru is None:
             self.prev_gru = gru_strength.copy()
@@ -112,14 +106,8 @@ class NeuralVisualizer:
         else:
             self.prev_delta = self.smoothing_alpha * delta_strength + (1 - self.smoothing_alpha) * self.prev_delta
 
-        if self.prev_input is None:
-            self.prev_input = float(input_val)
-        else:
-            self.prev_input = self.smoothing_alpha * float(input_val) + (1 - self.smoothing_alpha) * self.prev_input
-
         gru_strength = self.prev_gru
         delta_strength = self.prev_delta
-        input_val = self.prev_input
 
         # normalization
         max_val = 1e-6
@@ -127,7 +115,8 @@ class NeuralVisualizer:
             max_val = max(max_val, float(gru_strength.max()))
         if len(delta_strength) > 0:
             max_val = max(max_val, float(delta_strength.max()))
-        max_val = max(max_val, abs(float(input_val)))
+        for seq_item in seq_examples:
+            max_val = max(max_val, abs(float(seq_item[0])), abs(float(seq_item[1])))
 
         # helpers for color blending
         def hex_to_rgb(h):
@@ -138,7 +127,6 @@ class NeuralVisualizer:
             return '#%02x%02x%02x' % tuple(int(max(0, min(255, round(c*255)))) for c in rgb)
 
         def blend_with_white(base_hex, factor):
-            # factor 0..1 -> amount of base color (small factor keeps it light)
             br, bg, bb = hex_to_rgb(base_hex)
             wr, wg, wb = (1.0, 1.0, 1.0)
             r = wr * (1-factor) + br * factor
@@ -146,64 +134,59 @@ class NeuralVisualizer:
             b = wb * (1-factor) + bb * factor
             return rgb_to_hex((r, g, b))
 
-        base_gru = '#FFF59D'   # pastel yellow
+        base_seq = '#E3F2FD'   # light blue
         base_delta = '#FFD3A5' # pastel orange
-        base_input = '#E3F2FD' # light blue
+        base_gru = '#FFF59D'   # pastel yellow
 
         node_colors = []
         labels = {}
 
         for node in self.G.nodes():
-            if node == 'Input':
-                labels[node] = 'Input'
-                val = float(input_val)
-                factor = min(1.0, abs(val) / max_val) * 0.25
-                node_colors.append(blend_with_white(base_input, factor))
+            if node in self.seq_input_nodes:
+                idx = self.seq_input_nodes.index(node)
+                seq_value = seq_examples[idx]
+                labels[node] = f"[{seq_value[0]:.2f},{seq_value[1]:.2f}]"
+                factor = min(1.0, (abs(float(seq_value[0])) + abs(float(seq_value[1]))) / (2 * max_val)) * 0.4
+                node_colors.append(blend_with_white(base_seq, factor))
+
+            elif node in self.delta_input_nodes:
+                idx = self.delta_input_nodes.index(node)
+                if idx < len(delta_strength):
+                    val = float(delta_strength[idx])
+                    labels[node] = f"{val:.2f}"
+                    factor = min(1.0, abs(val) / max_val) * 0.5
+                    node_colors.append(blend_with_white(base_delta, factor))
+                else:
+                    labels[node] = '0.00'
+                    node_colors.append(blend_with_white(base_delta, 0.1))
 
             elif node.startswith('G'):
                 idx = int(node[1:])
                 if idx < len(gru_strength):
                     val = float(gru_strength[idx])
                     labels[node] = f"{val:.3f}"
-                    factor = min(1.0, abs(val) / max_val) * 0.5
+                    factor = min(1.0, abs(val) / max_val) * 0.6
                     node_colors.append(blend_with_white(base_gru, factor))
                 else:
                     labels[node] = '0.000'
                     node_colors.append(blend_with_white(base_gru, 0.0))
 
-            elif node.startswith('D'):
-                idx = int(node[1:])
-                if idx < len(delta_strength):
-                    val = float(delta_strength[idx])
-                    labels[node] = f"{val:.3f}"
-                    factor = min(1.0, abs(val) / max_val) * 0.6
-                    node_colors.append(blend_with_white(base_delta, factor))
-                else:
-                    labels[node] = '0.000'
-                    node_colors.append(blend_with_white(base_delta, 0.1))
-
             else:
-                # skip output from networkx draw; we'll draw it manually as a rectangle
                 continue
 
-        # draw only input + 12 middle nodes (exclude output)
         visible_nodes = [n for n in self.G.nodes() if n != 'Output']
-        visible_edges = [(u, v) for u, v in self.G.edges() if u != 'Output' and v != 'Output']
-
-        # add edges from all 12 middle nodes to Output
-        for node in self.gru_nodes + self.delta_nodes:
-            visible_edges.append((node, 'Output'))
+        visible_edges = [(u, v) for u, v in self.G.edges()]
 
         nx.draw_networkx_nodes(
             self.G,
             self.pos,
             nodelist=visible_nodes,
             node_color=node_colors,
-            node_size=1200,
+            node_size=900,
             ax=self.ax
         )
 
-        nx.draw_networkx_labels(self.G, self.pos, labels, ax=self.ax)
+        nx.draw_networkx_labels(self.G, self.pos, labels, ax=self.ax, font_size=8)
 
         nx.draw_networkx_edges(
             self.G,
@@ -225,27 +208,40 @@ class NeuralVisualizer:
         self.ax.text(output_x, output_y, f"Percent Error: {percent_error:.1f}%", ha='center', va='center',
                     fontsize=9, weight='bold')
 
-        # Draw boxes around sequence (8 GRU) and delta (4) groups
+        # Draw boxes around the sequence and delta input groups
         from matplotlib.patches import Rectangle
 
-        # sequence box (8 GRU nodes on left, indices 0-7)
-        seq_x_min, seq_x_max = -0.5, 7.5
-        seq_y_min, seq_y_max = 0.6, 1.4
+        seq_x_min, seq_x_max = -0.5, 3.5
+        seq_y_min, seq_y_max = 1.9, 2.4
         seq_rect = Rectangle((seq_x_min, seq_y_min), seq_x_max - seq_x_min, seq_y_max - seq_y_min,
                              linewidth=2, edgecolor='#FFC107', facecolor='none', linestyle='--')
         self.ax.add_patch(seq_rect)
-        self.ax.text(seq_x_min - 0.7, 1.0, 'Sequence', ha='right', fontsize=10, color='#FFC107', weight='bold')
+        self.ax.text(seq_x_min - 0.1, (seq_y_min + seq_y_max) / 2, 'Sequence', ha='right', va='center', fontsize=10, color='#FFC107', weight='bold')
 
-        # delta box (4 delta nodes on right, indices 8-11)
-        delta_x_min, delta_x_max = 7.5, 11.5
-        delta_y_min, delta_y_max = 0.6, 1.4
+        delta_x_min, delta_x_max = 3.5, 7.5
+        delta_y_min, delta_y_max = 1.9, 2.4
         delta_rect = Rectangle((delta_x_min, delta_y_min), delta_x_max - delta_x_min, delta_y_max - delta_y_min,
                                linewidth=2, edgecolor='#FF8A65', facecolor='none', linestyle='--')
         self.ax.add_patch(delta_rect)
-        self.ax.text(delta_x_max + 0.7, 1.0, 'Delta', ha='left', fontsize=10, color='#FF8A65', weight='bold')
+        self.ax.text(delta_x_min + 4.1, (delta_y_min + delta_y_max) / 2, 'Delta', ha='left', va='center', fontsize=10, color='#FF8A65', weight='bold')
 
-        self.ax.set_xlim(-1, 12)
-        self.ax.set_ylim(-0.5, 2.5)
+        # Draw a shared top label for the inputs layer
+        inputs_x_min = seq_x_min
+        inputs_x_max = delta_x_max
+        inputs_y = seq_y_max + 0.1
+        self.ax.plot([inputs_x_min, inputs_x_max], [inputs_y, inputs_y], color='#999999', linewidth=1)
+        self.ax.text((inputs_x_min + inputs_x_max) / 2, inputs_y + 0.05, 'Inputs', ha='center', va='bottom', fontsize=11, weight='bold', color='#333333')
+
+        # Draw box around hidden layer
+        hidden_x_min, hidden_x_max = -0.5, 7.5
+        hidden_y_min, hidden_y_max = 0.8, 1.3
+        hidden_rect = Rectangle((hidden_x_min, hidden_y_min), hidden_x_max - hidden_x_min, hidden_y_max - hidden_y_min,
+                                linewidth=2, edgecolor='#E57373', facecolor='none', linestyle='--')
+        self.ax.add_patch(hidden_rect)
+        self.ax.text(hidden_x_min - 0.1, (hidden_y_min + hidden_y_max) / 2, 'Hidden Layer', ha='right', va='center', fontsize=10, color='#E57373', weight='bold', rotation=90)
+
+        self.ax.set_xlim(-0.6, 7.6)
+        self.ax.set_ylim(-0.3, 2.8)
         self.ax.axis('off')
 
         self.ax.set_title(f"Epoch {epoch} Batch {batch}")

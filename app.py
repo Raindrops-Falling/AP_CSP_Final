@@ -165,12 +165,18 @@ def train(model, padded_train, length_tensor_train, delta_tensor_train, output_t
             with torch.no_grad():
                 seq_feats, delta_feats = model.get_features(batch_padded, batch_lengths, batch_deltas)
 
-                # compute input value: last valid timestep first feature of first sample
-                first_len = batch_lengths[0].item()
-                if first_len > 0:
-                    input_val = batch_padded[0, first_len - 1, 0].detach().cpu().item()
-                else:
-                    input_val = float(batch_padded[0].mean().detach().cpu().item())
+                # average the first 4 sequence positions across the batch
+                seq_slice = batch_padded[:, :4, :]
+                seq_example = []
+                for pos_idx in range(4):
+                    pos_values = seq_slice[:, pos_idx, :]
+                    valid = (pos_values[:, 0] != -1) | (pos_values[:, 1] != -1)
+                    if valid.sum() == 0:
+                        avg = np.array([-1.0, -1.0], dtype=np.float32)
+                    else:
+                        avg = pos_values[valid].float().mean(dim=0).cpu().numpy()
+                    seq_example.append(avg)
+                seq_example = np.stack(seq_example, axis=0)
 
                 # select representative GRU neurons evenly across hidden size
                 hidden_size = seq_feats.size(1)
@@ -181,7 +187,7 @@ def train(model, padded_train, length_tensor_train, delta_tensor_train, output_t
 
                 # select representative delta neurons evenly
                 delta_size = delta_feats.size(1)
-                num_d = len(visualizer.delta_nodes)
+                num_d = len(visualizer.delta_input_nodes)
                 step_d = max(1, delta_size // num_d)
                 indices_d = [step_d * i for i in range(num_d)]
                 delta_vals = delta_feats[0, indices_d]
@@ -201,7 +207,7 @@ def train(model, padded_train, length_tensor_train, delta_tensor_train, output_t
             if (batch_idx % vis_every == 0) or (batch_idx == len(dataloader)):
                 # compute average MAE across this batch group
                 avg_mae = sum(mae_accumulator) / len(mae_accumulator) if mae_accumulator else mae
-                visualizer.update(epoch + 1, batch_idx, avg_mae, input_val, gru_vals, delta_vals)
+                visualizer.update(epoch + 1, batch_idx, avg_mae, seq_example, delta_vals, gru_vals)
                 mae_accumulator = []  # reset accumulator
             print(f"Epoch {epoch+1}/{epochs} Batch {batch_idx}/{len(dataloader)}, Loss: {loss.item():.4f}")
 
