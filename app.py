@@ -2,7 +2,7 @@
 
 import pandas as pd
 import numpy as np
-
+from visualizer import NeuralVisualizer
 #the ai
 import torch
 import torch.nn as nn
@@ -36,6 +36,13 @@ class GRUModel(nn.Module):
         out=self.output_layer(x)
         return out
 
+    def get_features(self, padded, length_tensor, delta_tensor):
+        packed=pack_padded_sequence(padded, length_tensor, batch_first=True, enforce_sorted=False)
+        packed_out, h_n = self.gru(packed)
+        sequence_features=h_n.squeeze(0)
+        delta_t=delta_tensor.unsqueeze(1)
+        delta_features=self.act(self.delta_layer(delta_t))
+        return sequence_features, delta_features
 
 class noDELTAGRU(nn.Module):
     def __init__(self, hidden_dim):
@@ -128,17 +135,25 @@ def processing():
     
 criterion = nn.BCEWithLogitsLoss() 
 
-def train(model, padded_train, length_tensor_train, delta_tensor_train, output_tensor_train, epochs=10, batch_size=32):
+def train(model, padded_train, length_tensor_train, delta_tensor_train, output_tensor_train, epochs=3, batch_size=32, visualizer=None, vis_every=100, vis_sample_pct=0.5):
+    if visualizer is None:
+        visualizer = NeuralVisualizer()
+    
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     dataset = TensorDataset(padded_train, length_tensor_train, delta_tensor_train, output_tensor_train)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    # pass batches_per_epoch to visualizer for accurate global batch tracking
+    visualizer.batches_per_epoch = len(dataloader)
+    visualizer.show()
 
     for epoch in range(epochs):
         model.train()
         total_loss = 0.0
+        mae_accumulator = []  # accumulate MAE values for averaging
 
-        for batch_padded, batch_lengths, batch_deltas, batch_outputs in dataloader:
+        for batch_idx, (batch_padded, batch_lengths, batch_deltas, batch_outputs) in enumerate(dataloader, start=1):
             optimizer.zero_grad()
             preds = model(batch_padded, batch_lengths, batch_deltas).squeeze(1)
             loss = criterion(preds, batch_outputs)
@@ -146,14 +161,59 @@ def train(model, padded_train, length_tensor_train, delta_tensor_train, output_t
             optimizer.step()
             total_loss += loss.item() * batch_padded.size(0)
 
+            # get activations after the update so visualization reflects new params
+            with torch.no_grad():
+                seq_feats, delta_feats = model.get_features(batch_padded, batch_lengths, batch_deltas)
+
+                # compute input value: last valid timestep first feature of first sample
+                first_len = batch_lengths[0].item()
+                if first_len > 0:
+                    input_val = batch_padded[0, first_len - 1, 0].detach().cpu().item()
+                else:
+                    input_val = float(batch_padded[0].mean().detach().cpu().item())
+
+                # select representative GRU neurons evenly across hidden size
+                hidden_size = seq_feats.size(1)
+                num_g = len(visualizer.gru_nodes)
+                step = max(1, hidden_size // num_g)
+                indices = [step * (i + 1) - 1 for i in range(num_g)]
+                gru_vals = seq_feats[0, indices]
+
+                # select representative delta neurons evenly
+                delta_size = delta_feats.size(1)
+                num_d = len(visualizer.delta_nodes)
+                step_d = max(1, delta_size // num_d)
+                indices_d = [step_d * i for i in range(num_d)]
+                delta_vals = delta_feats[0, indices_d]
+
+                gru_vals = gru_vals.detach().cpu().numpy().flatten()
+                delta_vals = delta_vals.detach().cpu().numpy().flatten()
+
+                # compute MAE on a sample of the batch (probs vs targets)
+                probs = torch.sigmoid(preds)
+                bs = probs.size(0)
+                sample_size = max(1, int(vis_sample_pct * bs))
+                perm = torch.randperm(bs)[:sample_size]
+                mae = torch.mean(torch.abs(probs[perm] - batch_outputs[perm])).item()
+                mae_accumulator.append(mae*100)
+
+            # update visualization occasionally for speed
+            if (batch_idx % vis_every == 0) or (batch_idx == len(dataloader)):
+                # compute average MAE across this batch group
+                avg_mae = sum(mae_accumulator) / len(mae_accumulator) if mae_accumulator else mae
+                visualizer.update(epoch + 1, batch_idx, avg_mae, input_val, gru_vals, delta_vals)
+                mae_accumulator = []  # reset accumulator
+            print(f"Epoch {epoch+1}/{epochs} Batch {batch_idx}/{len(dataloader)}, Loss: {loss.item():.4f}")
+
         avg_loss = total_loss / len(dataset)
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch+1}/{epochs}, Avg Loss: {avg_loss:.4f}")
     return model
 
 def run():
     padded_train, length_tensor_train, delta_tensor_train, output_tensor_train, padded_test, length_tensor_test, delta_tensor_test, output_tensor_test = processing()
     model = GRUModel(hidden_dim=64)
-    train(model, padded_train, length_tensor_train, delta_tensor_train, output_tensor_train)
+    visualizer = NeuralVisualizer(output_path="training_plot.png")
+    train(model, padded_train, length_tensor_train, delta_tensor_train, output_tensor_train, visualizer=visualizer)
     torch.save(model.state_dict(), "dataset_prediction.pth")
     model.eval()
     with torch.no_grad():
@@ -164,6 +224,8 @@ def run():
         print((list(probs))[-1])
         print("Test loss:", loss)
         print("Test MAE:", mae)
+
+    plt.show(block=True)
 
 
 run()
